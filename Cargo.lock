@@ -2092,6 +2092,7 @@ dependencies = [
  "memofs",
  "num_cpus",
  "opener",
+ "parking_lot",
  "paste",
  "pathdiff",
  "pretty_assertions",

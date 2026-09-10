@@ -147,6 +147,13 @@ impl JobThreadContext {
         };
 
         for id in affected_ids {
+            if tree.get_metadata(id).is_none() {
+                log::trace!(
+                    "Instance {:?} was affected but no longer present in tree; skipping",
+                    id
+                );
+                continue;
+            }
             if let Some(patch) = compute_and_apply_changes(&mut tree, &self.vfs, id) {
                 if !patch.is_empty() {
                     applied_patches.push(patch);
@@ -161,23 +168,26 @@ impl JobThreadContext {
         log::trace!("Vfs event: {:?}", event);
 
         // Update the VFS immediately with the event.
-        self.vfs
-            .commit_event(&event)
-            .expect("Error applying VFS change");
+        if let Err(err) = self.vfs.commit_event(&event) {
+            log::error!("Error applying VFS change: {:?}", err);
+            return;
+        }
 
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
         let applied_patches = match event {
-            VfsEvent::Create(path) | VfsEvent::Write(path) => {
-                self.apply_patches(self.vfs.canonicalize(&path).unwrap())
-            }
-            VfsEvent::Remove(path) => {
-                // MemoFS does not track parent removals yet, so we can canonicalize
-                // the parent path safely and then append the removed path's file name.
-                let parent = path.parent().unwrap();
-                let file_name = path.file_name().unwrap();
-                let parent_normalized = self.vfs.canonicalize(parent).unwrap();
-                self.apply_patches(parent_normalized.join(file_name))
+            VfsEvent::Create(path) | VfsEvent::Write(path) | VfsEvent::Remove(path) => {
+                match canonicalize_event_path(&self.vfs, &path) {
+                    Ok(path) => self.apply_patches(path),
+                    Err(err) => {
+                        log::warn!(
+                            "Could not resolve filesystem event {}: {}",
+                            path.display(),
+                            err
+                        );
+                        Vec::new()
+                    }
+                }
             }
             _ => {
                 log::warn!("Unhandled VFS event: {:?}", event);
@@ -294,10 +304,45 @@ impl JobThreadContext {
     }
 }
 
+// Debounced events can outlive both their file and its containing directories.
+// Normalize the surviving ancestor and preserve the missing suffix so removals
+// still reconcile the original tree IDs instead of being dropped.
+fn canonicalize_event_path(vfs: &Vfs, path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = PathBuf::new();
+    loop {
+        match vfs.canonicalize(ancestor) {
+            Ok(mut normalized) => {
+                if !suffix.as_os_str().is_empty() {
+                    normalized.push(suffix);
+                }
+                return Ok(normalized);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match (ancestor.parent(), ancestor.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        suffix = PathBuf::from(name).join(suffix);
+                        ancestor = parent;
+                    }
+                    _ => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<AppliedPatchSet> {
-    let metadata = tree
-        .get_metadata(id)
-        .expect("metadata missing for instance present in tree");
+    let metadata = match tree.get_metadata(id) {
+        Some(metadata) => metadata,
+        None => {
+            log::trace!(
+                "Instance {:?} was affected by an event but is no longer present in the tree; skipping",
+                id
+            );
+            return None;
+        }
+    };
 
     let instigating_source = match &metadata.instigating_source {
         Some(path) => path,
@@ -327,6 +372,13 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                         return None;
                     }
                 };
+                if id == tree.get_root_id() && snapshot.is_none() {
+                    log::warn!(
+                        "Snapshot for root project file {} was None; retaining last good tree",
+                        path.display()
+                    );
+                    return None;
+                }
 
                 let patch_set = compute_patch_set(snapshot, tree, id);
                 apply_patch_set(tree, patch_set)
@@ -336,7 +388,15 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 // path no longer exists.
                 //
                 // We associate deleting the instigating file for an
-                // instance with deleting that instance.
+                // instance with deleting that instance, unless it is the root
+                // project, in which case we retain the last good tree.
+                if id == tree.get_root_id() {
+                    log::warn!(
+                        "Root project file {} is missing; retaining last good tree",
+                        path.display()
+                    );
+                    return None;
+                }
 
                 let mut patch_set = PatchSet::new();
                 patch_set.removed_instances.push(id);
@@ -375,6 +435,13 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                     return None;
                 }
             };
+            if id == tree.get_root_id() && snapshot.is_none() {
+                log::warn!(
+                    "Snapshot for root project node {} was None; retaining last good tree",
+                    path.display()
+                );
+                return None;
+            }
 
             let patch_set = compute_patch_set(snapshot, tree, id);
             apply_patch_set(tree, patch_set)
@@ -382,4 +449,328 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
     };
 
     Some(applied_patch_set)
+}
+
+#[cfg(test)]
+mod event_path_tests {
+    use super::*;
+    use memofs::StdBackend;
+
+    #[test]
+    fn deleted_parent_and_grandparent_keep_event_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("Assets/Nested");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("Child.luau");
+        fs::write(&path, "return 1").unwrap();
+        let expected = fs::canonicalize(&path).unwrap();
+        let vfs = Vfs::new(StdBackend::new().unwrap());
+        fs::remove_dir_all(root.path().join("Assets")).unwrap();
+        assert_eq!(canonicalize_event_path(&vfs, &path).unwrap(), expected);
+    }
+
+    #[test]
+    fn existing_event_path_is_canonicalized() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Child.luau");
+        fs::write(&path, "return 1").unwrap();
+        let vfs = Vfs::new(StdBackend::new().unwrap());
+        assert_eq!(
+            canonicalize_event_path(&vfs, &path).unwrap(),
+            fs::canonicalize(path).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_descendants_under_symlink_keep_canonical_identity() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("actual")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("actual"), root.path().join("alias")).unwrap();
+        let parent = root.path().join("alias/Assets");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("Child.luau");
+        fs::write(&path, "return 1").unwrap();
+        let expected = fs::canonicalize(&path).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+        let vfs = Vfs::new(StdBackend::new().unwrap());
+        assert_eq!(canonicalize_event_path(&vfs, &path).unwrap(), expected);
+    }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::*;
+    use crate::snapshot::{InstanceContext, InstanceSnapshot};
+    use memofs::StdBackend;
+
+    fn test_context(
+        root_dir: &std::path::Path,
+        project_name: &str,
+        project_json: &str,
+    ) -> (JobThreadContext, PathBuf, Ref) {
+        let project_path = root_dir.join(format!("{}.project.json", project_name));
+        fs::write(&project_path, project_json).unwrap();
+
+        let vfs = Vfs::new(StdBackend::new().unwrap());
+        let canonical_project_path = vfs.canonicalize(&project_path).unwrap();
+
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root_id = tree.get_root_id();
+        let context = InstanceContext::new();
+        let snapshot = snapshot_from_vfs(&context, &vfs, &canonical_project_path)
+            .unwrap()
+            .expect("initial snapshot should succeed");
+        let patch_set = compute_patch_set(Some(snapshot), &tree, root_id);
+        apply_patch_set(&mut tree, patch_set);
+
+        let tree_arc = Arc::new(Mutex::new(tree));
+        let vfs_arc = Arc::new(vfs);
+        let message_queue = Arc::new(MessageQueue::new());
+
+        (
+            JobThreadContext {
+                tree: tree_arc,
+                vfs: vfs_arc,
+                message_queue,
+            },
+            canonical_project_path,
+            root_id,
+        )
+    }
+
+    #[test]
+    fn root_delete_and_recreate_retains_last_good_and_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial_json = r#"{
+            "name": "TestProject",
+            "tree": {
+                "$className": "DataModel"
+            }
+        }"#;
+        let (ctx, project_path, root_id) = test_context(temp.path(), "default", initial_json);
+
+        let initial_cursor = ctx.message_queue.cursor();
+
+        // 1. Delete root project file
+        fs::remove_file(&project_path).unwrap();
+        ctx.handle_vfs_event(VfsEvent::Remove(project_path.clone()));
+
+        // Root MUST NOT be deleted; last good tree is retained
+        {
+            let tree = ctx.tree.lock().unwrap();
+            assert_eq!(tree.get_root_id(), root_id);
+            let root_inst = tree.get_instance(root_id).expect("root must be retained");
+            assert_eq!(root_inst.name(), "TestProject");
+        }
+        // No patch removing root should be emitted
+        assert_eq!(ctx.message_queue.cursor(), initial_cursor);
+
+        // 2. Recreate root project file with modified content
+        let updated_json = r#"{
+            "name": "UpdatedProject",
+            "tree": {
+                "$className": "DataModel"
+            }
+        }"#;
+        fs::write(&project_path, updated_json).unwrap();
+        ctx.handle_vfs_event(VfsEvent::Create(project_path.clone()));
+
+        // Root instance ID remains stable, and tree is updated
+        {
+            let tree = ctx.tree.lock().unwrap();
+            assert_eq!(tree.get_root_id(), root_id);
+            let root_inst = tree.get_instance(root_id).expect("root must exist");
+            assert_eq!(root_inst.name(), "UpdatedProject");
+        }
+        // Notification pushed to message queue
+        assert!(ctx.message_queue.cursor() > initial_cursor);
+    }
+
+    #[test]
+    fn malformed_and_restored_project_retains_last_good() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial_json = r#"{
+            "name": "ValidProject",
+            "tree": {
+                "$className": "DataModel"
+            }
+        }"#;
+        let (ctx, project_path, root_id) = test_context(temp.path(), "default", initial_json);
+
+        let initial_cursor = ctx.message_queue.cursor();
+
+        // 1. Overwrite with malformed JSON
+        fs::write(&project_path, "{ broken json ...").unwrap();
+        ctx.handle_vfs_event(VfsEvent::Write(project_path.clone()));
+
+        // Last good tree is retained
+        {
+            let tree = ctx.tree.lock().unwrap();
+            assert_eq!(tree.get_root_id(), root_id);
+            let root_inst = tree.get_instance(root_id).expect("root must be retained");
+            assert_eq!(root_inst.name(), "ValidProject");
+        }
+        assert_eq!(ctx.message_queue.cursor(), initial_cursor);
+
+        // 2. Restore with valid JSON
+        let restored_json = r#"{
+            "name": "RestoredProject",
+            "tree": {
+                "$className": "DataModel"
+            }
+        }"#;
+        fs::write(&project_path, restored_json).unwrap();
+        ctx.handle_vfs_event(VfsEvent::Write(project_path.clone()));
+
+        // Tree is updated and root ID is stable
+        {
+            let tree = ctx.tree.lock().unwrap();
+            assert_eq!(tree.get_root_id(), root_id);
+            let root_inst = tree.get_instance(root_id).expect("root must exist");
+            assert_eq!(root_inst.name(), "RestoredProject");
+        }
+        assert!(ctx.message_queue.cursor() > initial_cursor);
+    }
+
+    #[test]
+    fn repeated_atomic_saves_followed_by_source_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        let src_dir = temp.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let script_path = src_dir.join("Hello.server.luau");
+        fs::write(&script_path, "print('initial')").unwrap();
+
+        let initial_json = r#"{
+            "name": "AtomicTest",
+            "tree": {
+                "$className": "DataModel",
+                "Hello": {
+                    "$path": "src/Hello.server.luau"
+                }
+            }
+        }"#;
+        let (ctx, project_path, root_id) = test_context(temp.path(), "default", initial_json);
+
+        let canonical_script = ctx.vfs.canonicalize(&script_path).unwrap();
+
+        // Perform multiple atomic saves of the project file (write to tmp, then replace)
+        for i in 1..=3 {
+            let tmp_path = temp.path().join(format!("default.project.json.tmp{}", i));
+            let content = r#"{
+                "name": "AtomicTest",
+                "tree": {
+                    "$className": "DataModel",
+                    "Hello": {
+                        "$path": "src/Hello.server.luau"
+                    }
+                }
+            }"#;
+            fs::write(&tmp_path, content).unwrap();
+            fs::rename(&tmp_path, &project_path).unwrap();
+            ctx.handle_vfs_event(VfsEvent::Write(project_path.clone()));
+        }
+
+        // Verify root is still alive and stable
+        {
+            let tree = ctx.tree.lock().unwrap();
+            assert_eq!(tree.get_root_id(), root_id);
+        }
+
+        // Now edit the source file
+        fs::write(&script_path, "print('updated')").unwrap();
+        ctx.handle_vfs_event(VfsEvent::Write(canonical_script.clone()));
+
+        // Changes to child should be reflected
+        {
+            let tree = ctx.tree.lock().unwrap();
+            assert_eq!(tree.get_root_id(), root_id);
+            let mut found_child = false;
+            for inst in tree.descendants(root_id) {
+                if inst.name() == "Hello" {
+                    found_child = true;
+                    if let Some((_, Variant::String(source))) = inst
+                        .properties()
+                        .iter()
+                        .find(|(k, _)| k.as_str() == "Source")
+                    {
+                        assert_eq!(source.as_str(), "print('updated')");
+                    }
+                }
+            }
+            assert!(
+                found_child,
+                "child instance must still be present and updated"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_child_deletion_still_removes_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let src_dir = temp.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let child_path = src_dir.join("Child.server.luau");
+        fs::write(&child_path, "return 123").unwrap();
+
+        let initial_json = r#"{
+            "name": "ChildDelTest",
+            "tree": {
+                "$className": "DataModel",
+                "Workspace": {
+                    "$className": "Workspace",
+                    "$path": "src"
+                }
+            }
+        }"#;
+        let (ctx, _project_path, root_id) = test_context(temp.path(), "default", initial_json);
+
+        let canonical_child = ctx.vfs.canonicalize(&child_path).unwrap();
+
+        // Locate the child's Ref
+        let child_id = {
+            let tree = ctx.tree.lock().unwrap();
+            let mut found = None;
+            for inst in tree.descendants(root_id) {
+                if inst.name() == "Child" {
+                    found = Some(inst.id());
+                    break;
+                }
+            }
+            found.expect("Child instance must be present in tree")
+        };
+
+        // Delete the child file
+        fs::remove_file(&child_path).unwrap();
+        ctx.handle_vfs_event(VfsEvent::Remove(canonical_child));
+
+        // Verify child IS removed from tree, while root is unaffected
+        {
+            let tree = ctx.tree.lock().unwrap();
+            assert_eq!(tree.get_root_id(), root_id);
+            assert!(tree.get_instance(root_id).is_some());
+            assert!(
+                tree.get_instance(child_id).is_none(),
+                "child must be deleted from tree"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_affected_id_skipped_without_panic() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial_json = r#"{
+            "name": "StaleIdTest",
+            "tree": {
+                "$className": "DataModel"
+            }
+        }"#;
+        let (ctx, _project_path, _root_id) = test_context(temp.path(), "default", initial_json);
+
+        // compute_and_apply_changes with a nonexistent / stale Ref should return None and not panic
+        let stale_id = Ref::new();
+        let mut tree = ctx.tree.lock().unwrap();
+        let result = compute_and_apply_changes(&mut tree, &ctx.vfs, stale_id);
+        assert!(result.is_none());
+    }
 }
