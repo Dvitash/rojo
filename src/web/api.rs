@@ -505,12 +505,16 @@ async fn handle_websocket_subscription(
     // Now continuously listen for new messages using select to handle both incoming messages
     // and WebSocket control messages concurrently
     let mut cursor = input_cursor;
+    // Keep a single subscription alive across control frames. Re-subscribing
+    // after every ping/pong used to abandon listeners on otherwise idle servers.
+    let mut receiver = message_queue.subscribe(cursor);
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
     loop {
-        let receiver = message_queue.subscribe(cursor);
-
         tokio::select! {
             // Handle new messages from the message queue
-            result = receiver => {
+            result = &mut receiver => {
                 match result {
                     Ok((new_cursor, messages)) => {
                         if !messages.is_empty() {
@@ -549,6 +553,15 @@ async fn handle_websocket_subscription(
                         let _ = websocket.send(Message::Close(None)).await;
                         break;
                     }
+                }
+                receiver = message_queue.subscribe(cursor);
+            }
+
+            // Prevent idle network/proxy timeouts without creating DOM updates
+            // or advancing the message cursor.
+            _ = heartbeat.tick() => {
+                if websocket.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
                 }
             }
 
