@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 use rbx_dom_weak::{
@@ -390,6 +391,19 @@ impl InstanceWithMetaMut<'_> {
     pub fn inner_mut(&mut self) -> &mut Instance {
         self.instance
     }
+}
+
+/// Locks a shared [`RojoTree`], recovering the guard instead of panicking if
+/// the mutex has been poisoned.
+///
+/// A poisoned lock means some other thread panicked while holding the tree. A
+/// serve session must survive that: propagating the poison would make every
+/// later request panic as well, turning one contained panic into a dead
+/// session that the Studio plugin cannot reconnect to. Every mutation of the
+/// tree happens while its lock is held, so a panic can only leave the tree in a
+/// state that a subsequent full recomputation will repair.
+pub(crate) fn lock_tree(mutex: &Mutex<RojoTree>) -> MutexGuard<'_, RojoTree> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]

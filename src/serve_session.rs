@@ -17,8 +17,8 @@ use crate::{
     project::{Project, ProjectError},
     session_id::SessionId,
     snapshot::{
-        apply_patch_set, compute_patch_set, AppliedPatchSet, InstanceContext, InstanceSnapshot,
-        PatchSet, RojoTree,
+        apply_patch_set, compute_patch_set, lock_tree, AppliedPatchSet, InstanceContext,
+        InstanceSnapshot, PatchSet, RojoTree,
     },
     snapshot_middleware::snapshot_from_vfs,
 };
@@ -153,7 +153,7 @@ impl ServeSession {
     }
 
     pub fn tree(&self) -> MutexGuard<'_, RojoTree> {
-        self.tree.lock().unwrap()
+        lock_tree(&self.tree)
     }
 
     pub fn tree_mutation_sender(&self) -> Sender<PatchSet> {

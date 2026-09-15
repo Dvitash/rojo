@@ -775,3 +775,58 @@ fn forced_parent() {
         assert_snapshot!("forced_parent_serialize_model", model);
     });
 }
+
+#[test]
+fn serve_survives_rapid_file_churn_with_websocket() {
+    run_serve_test("scripts", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let session_id = info.session_id;
+
+        let ws_url = format!("ws://localhost:{}/api/socket/0", session.port());
+        let (mut socket, _resp) =
+            hyper_tungstenite::tungstenite::connect(ws_url).expect("Failed to connect websocket");
+
+        if let hyper_tungstenite::tungstenite::stream::MaybeTlsStream::Plain(s) = socket.get_ref() {
+            s.set_nonblocking(true).unwrap();
+        }
+
+        let src_dir = session.path().join("src");
+        for i in 0..50 {
+            let file_path = src_dir.join(format!("churn_{i}.lua"));
+            let dir_path = src_dir.join(format!("churn_dir_{i}"));
+            let nested_path = dir_path.join("nested.lua");
+
+            fs::write(&file_path, "return 'churn'").unwrap();
+            fs::create_dir_all(&dir_path).unwrap();
+            fs::write(&nested_path, "return 'nested'").unwrap();
+        }
+
+        // Wait for VFS to see creations and queue AppliedPatchSets
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Delete them before draining the websocket
+        for i in 0..50 {
+            let file_path = src_dir.join(format!("churn_{i}.lua"));
+            let dir_path = src_dir.join(format!("churn_dir_{i}"));
+
+            let _ = fs::remove_file(&file_path);
+            let _ = fs::remove_dir_all(&dir_path);
+        }
+
+        // Wait for VFS to apply deletions to tree
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        loop {
+            match socket.read() {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let _ = socket.close(None);
+
+        let post_info = session
+            .get_api_rojo()
+            .expect("Server must still be alive and respond");
+        assert_eq!(post_info.session_id, session_id);
+    });
+}

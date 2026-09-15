@@ -11,7 +11,8 @@ use std::{
 use crate::{
     message_queue::MessageQueue,
     snapshot::{
-        apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
+        apply_patch_set, compute_patch_set, lock_tree, AppliedPatchSet, InstigatingSource,
+        PatchSet, RojoTree,
     },
     snapshot_middleware::{snapshot_from_vfs, snapshot_project_node},
 };
@@ -121,7 +122,7 @@ impl JobThreadContext {
     /// It then computes and applies changes for each affected instance ID and
     /// returns a vector of applied patch sets.
     fn apply_patches(&self, path: PathBuf) -> Vec<AppliedPatchSet> {
-        let mut tree = self.tree.lock().unwrap();
+        let mut tree = lock_tree(&self.tree);
         let mut applied_patches = Vec::new();
 
         // Find the nearest ancestor to this path that has
@@ -204,7 +205,7 @@ impl JobThreadContext {
         log::trace!("Applying PatchSet from client: {:#?}", patch_set);
 
         let applied_patch = {
-            let mut tree = self.tree.lock().unwrap();
+            let mut tree = lock_tree(&self.tree);
 
             for &id in &patch_set.removed_instances {
                 if let Some(instance) = tree.get_instance(id) {

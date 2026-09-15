@@ -42,7 +42,25 @@ impl<'a> SubscribeMessage<'a> {
 
         let mut added = HashMap::new();
         for id in patch.added {
-            let instance = tree.get_instance(id).unwrap();
+            // Applied patches are queued as bare ids and only turned into
+            // messages here, at send time, long after the tree lock was
+            // released. Anything that changed the tree in the meantime (a file
+            // written and then deleted, a project reload replacing a subtree)
+            // can have removed an instance this patch still lists as added.
+            //
+            // Skipping the id instead of panicking is safe: the patch that
+            // removed the instance is already queued behind this one and will
+            // be delivered too, and the client treats a removal of an unknown
+            // id as a no-op. Its descendants are gone with it, so they are
+            // skipped as well.
+            let Some(instance) = tree.get_instance(id) else {
+                log::warn!(
+                    "Skipping instance {:?} in an outgoing patch: it is no longer in the tree",
+                    id
+                );
+                continue;
+            };
+
             added.insert(id, Instance::from_rojo_instance(instance));
 
             for instance in tree.descendants(id) {
@@ -311,4 +329,52 @@ pub enum ErrorResponseKind {
     BadRequest,
     Forbidden,
     InternalError,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{AppliedPatchUpdate, InstanceSnapshot};
+
+    /// Builds a tree with a single named child, returning the tree and the
+    /// child's id.
+    fn tree_with_child() -> (RojoTree, Ref) {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("ROOT").class_name("ROOT"));
+        let root_id = tree.get_root_id();
+        let child_id = tree.insert_instance(
+            root_id,
+            InstanceSnapshot::new().name("Child").class_name("Folder"),
+        );
+        (tree, child_id)
+    }
+
+    #[test]
+    fn skips_additions_for_instances_no_longer_in_the_tree() {
+        let (tree, child_id) = tree_with_child();
+
+        // An id that was queued as added and then removed from the tree before
+        // the patch was turned into an API message, which is what happens when
+        // a file is created and deleted faster than the socket drains.
+        let stale_id = Ref::new();
+        let removed_id = Ref::new();
+
+        let patch = AppliedPatchSet {
+            removed: vec![removed_id],
+            added: vec![child_id, stale_id],
+            updated: vec![AppliedPatchUpdate::new(child_id)],
+        };
+
+        let message = SubscribeMessage::from_patch_update(&tree, patch);
+
+        // The id that is still in the tree is delivered as before.
+        assert_eq!(message.added.len(), 1);
+        assert_eq!(message.added[&child_id].name, "Child");
+
+        // The stale id is dropped rather than panicking, and the removed and
+        // updated sections are forwarded untouched.
+        assert!(!message.added.contains_key(&stale_id));
+        assert_eq!(message.removed, vec![removed_id]);
+        assert_eq!(message.updated.len(), 1);
+        assert_eq!(message.updated[0].id, child_id);
+    }
 }

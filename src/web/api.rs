@@ -14,7 +14,7 @@ use rbx_dom_weak::{
 
 use crate::{
     serve_session::ServeSession,
-    snapshot::{InstanceWithMeta, PatchSet, PatchUpdate},
+    snapshot::{lock_tree, InstanceWithMeta, PatchSet, PatchUpdate},
     web::{
         interface::{
             ErrorResponse, Instance, MessagesPacket, OpenResponse, ReadResponse,
@@ -519,7 +519,7 @@ async fn handle_websocket_subscription(
                     Ok((new_cursor, messages)) => {
                         if !messages.is_empty() {
                             let msgpack_message = {
-                                let tree = tree_handle.lock().unwrap();
+                                let tree = lock_tree(&tree_handle);
                                 let api_messages = messages
                                     .into_iter()
                                     .map(|patch| SubscribeMessage::from_patch_update(&tree, patch))

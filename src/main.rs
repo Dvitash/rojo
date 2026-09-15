@@ -1,4 +1,4 @@
-use std::{env, panic, process};
+use std::{env, panic, process, thread};
 
 use backtrace::Backtrace;
 use clap::Parser;
@@ -9,7 +9,14 @@ fn main() {
     #[cfg(feature = "profile-with-tracy")]
     profiling::tracy_client::Client::start();
 
-    panic::set_hook(Box::new(|panic_info| {
+    // Only a panic on the main thread should end the process. Every other
+    // thread belongs to a piece of work that can be dropped on its own: a
+    // connection task, the change processor, the async runtime's workers. If
+    // those aborted the process, one internal bug would kill a live serve
+    // session and force the Studio plugin to reconnect.
+    let main_thread_id = thread::current().id();
+
+    panic::set_hook(Box::new(move |panic_info| {
         // PanicInfo's payload is usually a &'static str or String.
         // See: https://doc.rust-lang.org/beta/std/panic/struct.PanicInfo.html#method.payload
         let message = match panic_info.payload().downcast_ref::<&str>() {
@@ -50,6 +57,15 @@ fn main() {
             eprintln!(
                 "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace."
             );
+        }
+
+        // The hook runs on the panicking thread, so this identifies it.
+        if thread::current().id() != main_thread_id {
+            log::warn!(
+                "Contained panic on a worker thread; the server keeps running. \
+                 Only the work that hit it was dropped."
+            );
+            return;
         }
 
         process::exit(1);

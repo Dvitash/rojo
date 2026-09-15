@@ -19,10 +19,15 @@ build = "build.rs"
 exclude = ["/test-projects/**"]
 
 [profile.dev]
-panic = "abort"
+# A panic inside a spawned connection task must unwind so it kills only that
+# task. With `abort`, a single internal panic takes down the whole serve
+# session, which the Studio plugin cannot recover from.
+panic = "unwind"
 
 [profile.release]
-panic = "abort"
+# See the note on `[profile.dev]`: connection tasks must not be able to abort
+# a live serve session.
+panic = "unwind"
 
 [features]
 default = []
